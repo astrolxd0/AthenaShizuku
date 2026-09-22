@@ -7,6 +7,7 @@ import android.content.ComponentName
 import android.content.ServiceConnection
 import android.os.Binder
 import android.os.IBinder
+import com.kin.athena.BuildConfig
 import com.kin.athena.core.logging.Logger
 import com.kin.athena.domain.model.Application
 import com.kin.athena.domain.usecase.application.ApplicationUseCases
@@ -24,10 +25,19 @@ import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import rikka.shizuku.Shizuku
+import java.util.Collections
 import javax.inject.Inject
 
+/**
+ * Shizuku-backed firewall.
+ *
+ * Android's FIREWALL_CHAIN_OEM_DENY_3 is a deny-list: enabling it blocks nothing
+ * until packages are explicitly added. So on start we enable the chain and then
+ * push a deny for every app whose access is switched off, and on stop we lift
+ * those denies before disabling the chain.
+ */
 @AndroidEntryPoint
 class ShizukuConnectionService : Service(), CoroutineScope by CoroutineScope(Dispatchers.IO), FirewallService {
 
@@ -42,9 +52,12 @@ class ShizukuConnectionService : Service(), CoroutineScope by CoroutineScope(Dis
     private var isLoggingEnabled = false
     private var tcpLoggerJob: kotlinx.coroutines.Job? = null
     private var udpLoggerJob: kotlinx.coroutines.Job? = null
-    
+
     // Track logged connections to avoid duplicates
     private val loggedConnections = mutableSetOf<String>()
+
+    // Packages we currently hold a deny bit for on the OEM_DENY_3 chain.
+    private val deniedPackages: MutableSet<String> = Collections.synchronizedSet(mutableSetOf())
 
     private val binder = LocalBinder()
 
@@ -57,8 +70,9 @@ class ShizukuConnectionService : Service(), CoroutineScope by CoroutineScope(Dis
             ComponentName(appContext.packageName, ShizukuFirewallUserService::class.java.name)
         )
             .processNameSuffix("firewall_service")
-            .debuggable(true)
-        // version etc if needed
+            .debuggable(BuildConfig.DEBUG)
+            // Bumping the version makes Shizuku restart a cached user service after an app update.
+            .version(BuildConfig.VERSION_CODE)
     }
 
     private val connection = object : ServiceConnection {
@@ -67,14 +81,8 @@ class ShizukuConnectionService : Service(), CoroutineScope by CoroutineScope(Dis
             shizukuFirewallService = IShizukuFirewallService.Stub.asInterface(service)
             isServiceBound = true
 
-            // Once bound, ensure the firewall chain is enabled
-            enableFirewallChainSafely()
-            
-            // Start logging if it was enabled before service was bound
-            if (isLoggingEnabled) {
-                Logger.debug("ShizukuConnectionService: Starting deferred packet logging")
-                startPacketLogging()
-            }
+            // Binder calls block, keep them off the main thread.
+            launch { applyInitialRules() }
         }
 
         override fun onServiceDisconnected(name: ComponentName) {
@@ -96,10 +104,8 @@ class ShizukuConnectionService : Service(), CoroutineScope by CoroutineScope(Dis
     override fun onCreate() {
         super.onCreate()
         Logger.info("ShizukuConnectionService: onCreate")
-        // Log to verify dependencies are injected
-        Logger.debug("ShizukuConnectionService: logUseCases initialized: ${::logUseCases.isInitialized}")
-        Logger.debug("ShizukuConnectionService: firewallManager initialized: ${::firewallManager.isInitialized}")
-        firewallManager.update(FirewallStatus.OFFLINE)
+        // Note: this Android-managed instance is created by FirewallManager.bindService()
+        // while the Hilt singleton instance is already LOADING. Do not reset the status here.
     }
 
     override fun onDestroy() {
@@ -120,16 +126,17 @@ class ShizukuConnectionService : Service(), CoroutineScope by CoroutineScope(Dis
 
     override fun stopService(context: Context) {
         Logger.info("ShizukuConnectionService: stopService called")
-        
+
         stopPacketLogging()
-        
-        launch {
-            disableFirewallChainSafely()
-        }
-        
         firewallManager.update(FirewallStatus.OFFLINE)
-        unbindUserService()
-        context.stopService(Intent(context, ShizukuConnectionService::class.java))
+
+        launch {
+            // Lift our denies and disable the chain BEFORE dropping the user service,
+            // otherwise the rules outlive the firewall.
+            tearDownRules()
+            unbindUserService()
+            context.stopService(Intent(context, ShizukuConnectionService::class.java))
+        }
     }
 
     override fun updateRules(application: Application?) {
@@ -143,7 +150,7 @@ class ShizukuConnectionService : Service(), CoroutineScope by CoroutineScope(Dis
     override fun updateLogs(enabled: Boolean) {
         Logger.info("ShizukuConnectionService: updateLogs($enabled)")
         isLoggingEnabled = enabled
-        
+
         if (enabled) {
             Logger.info("Shizuku firewall logging started")
             startPacketLogging()
@@ -175,7 +182,18 @@ class ShizukuConnectionService : Service(), CoroutineScope by CoroutineScope(Dis
 
     private fun bindUserService() {
         if (!Shizuku.pingBinder()) {
-            Logger.warn("ShizukuConnectionService: Shizuku not available yet")
+            Logger.warn("ShizukuConnectionService: Shizuku not running")
+            firewallManager.update(FirewallStatus.OFFLINE)
+            return
+        }
+        if (Shizuku.checkSelfPermission() != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            Logger.warn("ShizukuConnectionService: Shizuku permission not granted")
+            firewallManager.update(FirewallStatus.OFFLINE)
+            return
+        }
+        if (isServiceBound && shizukuFirewallService != null) {
+            Logger.debug("ShizukuConnectionService: user service already bound, re-applying rules")
+            launch { applyInitialRules() }
             return
         }
         try {
@@ -183,6 +201,7 @@ class ShizukuConnectionService : Service(), CoroutineScope by CoroutineScope(Dis
             Logger.debug("ShizukuConnectionService: binding user service")
         } catch (e: Exception) {
             Logger.error("ShizukuConnectionService: failed to bind user service: ${e.message}")
+            firewallManager.update(FirewallStatus.OFFLINE)
         }
     }
 
@@ -200,57 +219,88 @@ class ShizukuConnectionService : Service(), CoroutineScope by CoroutineScope(Dis
         }
     }
 
-    private fun enableFirewallChainSafely() {
+    /**
+     * Enables the deny chain and pushes a deny for every app whose access is off.
+     * Runs on the IO dispatcher once the user service is connected.
+     */
+    private suspend fun applyInitialRules() {
         val svc = shizukuFirewallService
-        if (svc != null) {
-            try {
-                Logger.debug("ShizukuConnectionService: calling enableFirewallChain() on user service...")
-                val result = svc.enableFirewallChain()
-                Logger.debug("ShizukuConnectionService: enableFirewallChain() returned: $result")
-                
-                if (result) {
-                    Logger.info("ShizukuConnectionService: firewall chain enabled")
-                    // continue loading apps, etc.
-                    firewallManager.update(FirewallStatus.LOADING(0.5f))
-                    launch {
-                        loadApplications()
-                    }
-                } else {
-                    Logger.warn("ShizukuConnectionService: enableFirewallChain returned false")
-                    firewallManager.update(FirewallStatus.OFFLINE)  // or error
-                }
-            } catch (e: Exception) {
-                Logger.error("ShizukuConnectionService: exception enabling firewall chain: ${e.message}")
+        if (svc == null) {
+            Logger.warn("ShizukuConnectionService: cannot apply rules — user service not bound")
+            firewallManager.update(FirewallStatus.OFFLINE)
+            return
+        }
+
+        try {
+            if (!svc.enableFirewallChain()) {
+                Logger.error("ShizukuConnectionService: enableFirewallChain failed — is `cmd connectivity set-chain3-enabled` available on this device?")
                 firewallManager.update(FirewallStatus.OFFLINE)
+                return
             }
-        } else {
-            Logger.warn("ShizukuConnectionService: cannot enable chain — user service not bound yet")
+            Logger.info("ShizukuConnectionService: firewall chain enabled")
+            firewallManager.update(FirewallStatus.LOADING(0.05f))
+
+            loadApplications()
+            val apps = installedApplications ?: emptyList()
+            val toDeny = apps.filter { !it.isAllowed() }.map { it.packageID }
+            Logger.info("ShizukuConnectionService: applying deny rules for ${toDeny.size}/${apps.size} apps")
+
+            deniedPackages.clear()
+            toDeny.forEachIndexed { index, packageName ->
+                if (svc.setPackageNetworking(packageName, false)) {
+                    deniedPackages.add(packageName)
+                }
+                val progress = 0.05f + 0.9f * (index + 1) / toDeny.size.coerceAtLeast(1)
+                firewallManager.update(FirewallStatus.LOADING(progress))
+            }
+            Logger.info("ShizukuConnectionService: ${deniedPackages.size}/${toDeny.size} deny rules applied")
+
+            installedApplications?.let { showStartNotification(it, preferencesUseCases, appContext) }
+            firewallManager.update(FirewallStatus.ONLINE)
+
+            // Start logging automatically like root service does
+            if (::logUseCases.isInitialized) {
+                isLoggingEnabled = true
+                startPacketLogging()
+            } else {
+                Logger.error("ShizukuConnectionService: Cannot start logging - logUseCases not initialized!")
+            }
+        } catch (e: Exception) {
+            Logger.error("ShizukuConnectionService: exception applying rules: ${e.message}")
+            firewallManager.update(FirewallStatus.OFFLINE)
         }
     }
 
-    private fun disableFirewallChainSafely() {
+    /**
+     * Lifts every deny we own and disables the chain. Safe to call when unbound.
+     */
+    private fun tearDownRules() {
         val svc = shizukuFirewallService
-        if (svc != null) {
-            try {
-                Logger.debug("ShizukuConnectionService: calling disableFirewallChain() on user service...")
-                val result = svc.disableFirewallChain()
-                Logger.debug("ShizukuConnectionService: disableFirewallChain() returned: $result")
-                
-                if (result) {
-                    Logger.info("ShizukuConnectionService: firewall chain disabled successfully")
-                } else {
-                    Logger.warn("ShizukuConnectionService: disableFirewallChain returned false")
-                }
-            } catch (e: Exception) {
-                Logger.error("ShizukuConnectionService: exception disabling firewall chain: ${e.message}")
+        if (svc == null) {
+            Logger.warn("ShizukuConnectionService: cannot tear down rules — user service not bound")
+            deniedPackages.clear()
+            return
+        }
+        try {
+            val denied = synchronized(deniedPackages) { deniedPackages.toList() }
+            if (denied.isNotEmpty()) {
+                val restored = svc.setPackagesNetworking(denied, true)
+                Logger.info("ShizukuConnectionService: restored networking for $restored/${denied.size} apps")
             }
-        } else {
-            Logger.warn("ShizukuConnectionService: cannot disable chain — user service not bound")
+            deniedPackages.clear()
+
+            if (svc.disableFirewallChain()) {
+                Logger.info("ShizukuConnectionService: firewall chain disabled")
+            } else {
+                Logger.warn("ShizukuConnectionService: disableFirewallChain returned false")
+            }
+        } catch (e: Exception) {
+            Logger.error("ShizukuConnectionService: exception tearing down rules: ${e.message}")
         }
     }
 
     private suspend fun loadApplications() {
-        runBlocking {
+        withContext(Dispatchers.IO) {
             applicationUseCases.getApplications.execute().fold(
                 ifSuccess = {
                     installedApplications = it
@@ -260,39 +310,20 @@ class ShizukuConnectionService : Service(), CoroutineScope by CoroutineScope(Dis
                 }
             )
         }
-        firewallManager.update(FirewallStatus.LOADING(0.5f))
-        installedApplications?.let { apps ->
-            showStartNotification(apps, preferencesUseCases, appContext)
-        }
-        // mark fully online
-        firewallManager.update(FirewallStatus.ONLINE)
-        
-        // Start logging automatically like root service does
-        installedApplications?.let {
-            // Ensure all dependencies are initialized before starting logging
-            if (::logUseCases.isInitialized) {
-                launch { 
-                    isLoggingEnabled = true
-                    startPacketLogging() 
-                }
-            } else {
-                Logger.error("ShizukuConnectionService: Cannot start logging - logUseCases not initialized!")
-            }
-        }
     }
 
     private fun startPacketLogging() {
         if (!isLoggingEnabled) return
-        
+
         // Cancel any existing jobs first
         stopPacketLogging()
-        
+
         // Check if service is bound before starting
         if (!isServiceBound || shizukuFirewallService == null) {
             Logger.warn("Cannot start packet logging: Shizuku service not bound yet")
             return
         }
-        
+
         tcpLoggerJob = launch {
             try {
                 Logger.info("Starting TCP packet logging via Shizuku")
@@ -301,17 +332,17 @@ class ShizukuConnectionService : Service(), CoroutineScope by CoroutineScope(Dis
                 Logger.error("TCP packet logging failed: ${e.message}")
             }
         }
-        
+
         udpLoggerJob = launch {
             try {
-                Logger.info("Starting UDP packet logging via Shizuku") 
+                Logger.info("Starting UDP packet logging via Shizuku")
                 monitorNetworkConnections("udp")
             } catch (e: Exception) {
                 Logger.error("UDP packet logging failed: ${e.message}")
             }
         }
     }
-    
+
     private fun stopPacketLogging() {
         tcpLoggerJob?.cancel()
         udpLoggerJob?.cancel()
@@ -320,7 +351,7 @@ class ShizukuConnectionService : Service(), CoroutineScope by CoroutineScope(Dis
         loggedConnections.clear()
         Logger.info("Stopped packet logging")
     }
-    
+
     private suspend fun monitorNetworkConnections(protocol: String) {
         while (isLoggingEnabled && isServiceBound) {
             try {
@@ -330,7 +361,7 @@ class ShizukuConnectionService : Service(), CoroutineScope by CoroutineScope(Dis
                     kotlinx.coroutines.delay(1000)
                     continue
                 }
-                
+
                 val result = svc.executeCommand("cat /proc/net/$protocol")
                 if (result.isNotEmpty()) {
                     Logger.debug("Received $protocol data: ${result.lines().size} lines")
@@ -346,10 +377,10 @@ class ShizukuConnectionService : Service(), CoroutineScope by CoroutineScope(Dis
         }
         Logger.info("Stopped monitoring $protocol connections")
     }
-    
+
     private fun parseNetworkConnections(data: String, protocol: String) {
         if (!isLoggingEnabled) return
-        
+
         launch {
             try {
                 data.lines().drop(1).forEach { line ->
@@ -362,35 +393,34 @@ class ShizukuConnectionService : Service(), CoroutineScope by CoroutineScope(Dis
             }
         }
     }
-    
+
     private fun parseConnectionLine(line: String, protocol: String) {
         try {
             val parts = line.trim().split("\\s+".toRegex())
             if (parts.size < 8) return
-            
+
             val localAddress = parts[1]
             val remoteAddress = parts[2]
             val uid = parts[7].toIntOrNull() ?: return
-            
+
             val (sourceIP, sourcePort) = parseAddress(localAddress)
             val (destIP, destPort) = parseAddress(remoteAddress)
-            
+
             if (destIP != "0.0.0.0" && destPort != "0") {
                 // Create unique key for this connection to avoid duplicates
                 val connectionKey = "$protocol:$uid:$destIP:$destPort"
-                
+
                 // Skip if already logged
                 if (loggedConnections.contains(connectionKey)) {
                     return
                 }
-                
+
                 val app = installedApplications?.firstOrNull { it.uid == uid }
-                // Check if app has internet access enabled
-                // For Shizuku firewall, we primarily check internetAccess flag
-                val isAllowed = app?.internetAccess ?: true
-                
+                // The Shizuku chain blocks all networking when either toggle is off.
+                val isAllowed = app?.isAllowed() ?: true
+
                 Logger.debug("Logging connection: $protocol UID=$uid $destIP:$destPort (allowed=$isAllowed)")
-                
+
                 val log = Log(
                     time = System.currentTimeMillis(),
                     protocol = protocol,
@@ -402,7 +432,7 @@ class ShizukuConnectionService : Service(), CoroutineScope by CoroutineScope(Dis
                     destinationPort = destPort,
                     packetStatus = if (isAllowed) FirewallResult.ACCEPT else FirewallResult.DROP
                 )
-                
+
                 launch {
                     if (::logUseCases.isInitialized) {
                         val result = logUseCases.addLog.execute(log)
@@ -425,7 +455,7 @@ class ShizukuConnectionService : Service(), CoroutineScope by CoroutineScope(Dis
             Logger.debug("Error parsing connection line: ${e.message}")
         }
     }
-    
+
     private fun parseAddress(address: String): Pair<String, String> {
         try {
             val (hexIP, hexPort) = address.split(":")
@@ -436,7 +466,7 @@ class ShizukuConnectionService : Service(), CoroutineScope by CoroutineScope(Dis
             return Pair("0.0.0.0", "0")
         }
     }
-    
+
     private fun hexToIP(hex: String): String {
         try {
             val bytes = hex.chunked(2).map { it.toInt(16).toByte() }.reversed()
@@ -446,17 +476,24 @@ class ShizukuConnectionService : Service(), CoroutineScope by CoroutineScope(Dis
         }
     }
 
-    private suspend fun setAppNetworking(app: Application) {
-        val allow = app.internetAccess && app.cellularAccess
+    // The OEM_DENY_3 chain cannot tell Wi-Fi from cellular, so an app is only
+    // allowed when both toggles are on.
+    private fun Application.isAllowed(): Boolean = internetAccess && cellularAccess
+
+    private fun setAppNetworking(app: Application) {
+        val allow = app.isAllowed()
         val svc = shizukuFirewallService
         if (svc != null && isServiceBound) {
             try {
                 val success = svc.setPackageNetworking(app.packageID, allow)
                 if (success) {
+                    if (allow) deniedPackages.remove(app.packageID) else deniedPackages.add(app.packageID)
                     Logger.debug("ShizukuConnectionService: setPackageNetworking for ${app.packageID} = $allow succeeded")
                 } else {
                     Logger.warn("ShizukuConnectionService: setPackageNetworking for ${app.packageID} = $allow failed")
                 }
+                // Keep the cached list in sync so logging reflects the new state.
+                installedApplications = installedApplications?.map { if (it.packageID == app.packageID) app else it }
             } catch (e: Exception) {
                 Logger.error("ShizukuConnectionService: exception setting package networking: ${e.message}")
             }

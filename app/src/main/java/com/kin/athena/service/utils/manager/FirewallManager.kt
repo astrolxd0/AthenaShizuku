@@ -155,8 +155,8 @@ class FirewallManager @Inject constructor(
     }
 
     fun setFirewallMode(mode: FirewallMode) {
-        updateService()
         firewallStateManager.mode = mode
+        updateService()
     }
 
     fun startFirewall() {

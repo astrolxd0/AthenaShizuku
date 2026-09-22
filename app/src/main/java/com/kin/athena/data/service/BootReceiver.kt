@@ -74,6 +74,11 @@ class BootReceiver : BroadcastReceiver() {
                                 if (settings.useRootMode == true) {
                                     firewallManager.setFirewallMode(FirewallMode.ROOT)
                                     firewallManager.startFirewall()
+                                } else if (settings.useShizukuMode == true) {
+                                    // The OEM_DENY_3 chain does not survive a reboot, so re-apply.
+                                    // Fails soft if Shizuku itself has not been started yet.
+                                    firewallManager.setFirewallMode(FirewallMode.SHIZUKU)
+                                    firewallManager.startFirewall()
                                 } else {
                                     if (VpnManager.permissionChecker(context)) {
                                         firewallManager.startFirewall()

@@ -17,14 +17,23 @@
 
 package com.kin.athena.core.utils
 
+import android.os.Build
 import com.kin.athena.core.logging.Logger
 import rikka.shizuku.Shizuku
 
 object ShizukuUtils {
-    
+
+    /**
+     * The Shizuku firewall drives FIREWALL_CHAIN_OEM_DENY_3 through
+     * `cmd connectivity`, which only exists on Android 13+ (and even there
+     * depends on the Connectivity mainline module being reasonably current).
+     */
+    fun isShizukuSupportedOnThisAndroid(): Boolean =
+        Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
+
     fun isShizukuAvailable(): Boolean {
         return try {
-            Shizuku.pingBinder()
+            isShizukuSupportedOnThisAndroid() && Shizuku.pingBinder()
         } catch (e: Exception) {
             false
         }
